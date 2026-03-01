@@ -4,17 +4,23 @@
 // ============================================================
 //  TAXIMETER PULSE GENERATOR - Configuration
 // ============================================================
-//  Board: ESP32 with ST7789 1.14" TFT
-//         (IdealSpark TM-ESP32-114LCDSP / TTGO T-Display)
+//  MCU:     ESP32 (IdealSpark TM-ESP32-114LCDSP / any ESP32)
+//  Display: MSP4021 4.0" ST7796 SPI TFT (320x480) with touch
+//  Library: TFT_eSPI (see TFT_User_Setup.h)
 // ============================================================
 
-// -- Display (ST7789 135x240) --------------------------------
-#define TFT_CS    5
-#define TFT_DC    16
-#define TFT_RST   23
-#define TFT_MOSI  19
-#define TFT_SCLK  18
-#define TFT_BL    4
+// -- Display pins are defined in TFT_User_Setup.h -------------
+//    (must be copied to TFT_eSPI library folder as User_Setup.h)
+//
+//    TFT_MOSI  = 23      TFT_CS   = 15
+//    TFT_SCLK  = 18      TFT_DC   = 2
+//    TFT_MISO  = 19      TFT_RST  = 4
+//    TOUCH_CS  = 33
+
+// -- Disable the built-in TFT on T-Display boards ------------
+// GPIO 5 was the built-in ST7789 CS pin. We hold it HIGH so
+// the built-in display ignores all SPI traffic.
+#define BUILTIN_TFT_CS  5
 
 // -- Speed Control (Potentiometer) ---------------------------
 // Use an input-only ADC1 pin (GPIO 36/VP recommended)
@@ -53,7 +59,7 @@
 
 // Calculated constants (do not change)
 // 1 MPH = 1.609344 km/h
-// At 1 km/h: freq = 1/1.609344 Hz, over 1 hour = 3600/1.609344 = 2236.94 pulses
+// At 1 km/h: freq = 1/1.609344 Hz, over 1 hour = 3600/1.609344 = 2236.94
 #define PULSES_PER_KM   (2237L * PULSE_MODE)
 
 // ============================================================
@@ -68,16 +74,40 @@
 // ============================================================
 //  TIMING
 // ============================================================
-#define DISPLAY_UPDATE_MS   200     // Display refresh interval
+#define DISPLAY_UPDATE_MS   150     // Display refresh interval
 #define SAVE_INTERVAL_MS    30000   // Save total distance to NVS every 30s
 #define DEBOUNCE_MS         250     // Button debounce time
 
 // ============================================================
+//  DISPLAY LAYOUT (landscape 480x320)
+// ============================================================
+#define SCREEN_W        480
+#define SCREEN_H        320
+#define HEADER_H        34
+#define BAR_H           40
+#define PANEL_SPLIT_X   242     // Left/right panel divider
+#define CONTENT_TOP     (HEADER_H + 2)
+#define CONTENT_BOT     (SCREEN_H - BAR_H - 2)
+#define BAR_Y           (SCREEN_H - BAR_H)
+
+// Right-panel section boundaries
+#define RIGHT_X         (PANEL_SPLIT_X + 2)
+#define RIGHT_W         (SCREEN_W - RIGHT_X - 2)
+#define SECT_TRIP_Y     CONTENT_TOP
+#define SECT_TRIP_H     80
+#define SECT_TOTAL_Y    (SECT_TRIP_Y + SECT_TRIP_H + 2)
+#define SECT_TOTAL_H    80
+#define SECT_OUTPUT_Y   (SECT_TOTAL_Y + SECT_TOTAL_H + 2)
+#define SECT_OUTPUT_H   (CONTENT_BOT - SECT_OUTPUT_Y)
+
+// ============================================================
 //  DISPLAY COLORS (RGB565)
 // ============================================================
+#define COLOR_BG            0x0000  // Black
 #define COLOR_HEADER_BG     0x000F  // Dark blue
 #define COLOR_HEADER_TEXT   0xFFFF  // White
 #define COLOR_SPEED         0x07E0  // Green
+#define COLOR_SPEED_GHOST   0x0200  // Dark green (7-seg ghost)
 #define COLOR_LABEL         0x8410  // Gray
 #define COLOR_TRIP          0x07FF  // Cyan
 #define COLOR_TOTAL         0xFD20  // Orange
@@ -85,6 +115,8 @@
 #define COLOR_RUNNING       0x07E0  // Green
 #define COLOR_STOPPED       0xF800  // Red
 #define COLOR_DIVIDER       0x2104  // Dark gray
+#define COLOR_BAR_BG        0x1082  // Very dark gray
+#define COLOR_PANEL_BG      0x0841  // Panel background
 
 // ============================================================
 //  OUTPUT INVERSION

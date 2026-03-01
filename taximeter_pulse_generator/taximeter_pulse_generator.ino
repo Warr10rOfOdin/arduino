@@ -9,49 +9,43 @@
 //  Standard calibration: 1 Hz = 1 MPH  (k = 2237 pulses/km)
 //  Also supports 4x and 10x CANM8 variants via config.h
 //
-//  Hardware: ESP32 with built-in 1.14" ST7789 TFT
-//            + potentiometer for speed control
-//            + optional NPN transistor for 12V output
+//  Hardware:
+//    MCU:     ESP32 (any variant with enough free GPIO)
+//    Display: MSP4021 4.0" ST7796 SPI TFT 320x480 w/ touch
+//    Input:   Potentiometer for speed, two push-buttons
+//    Output:  Square wave pulse (3.3V or 12V via NPN)
 //
-//  Display shows:
-//    - Current speed (km/h)
-//    - Trip distance (km) - resettable
-//    - Total distance (km) - persistent across power cycles
-//    - Pulse frequency (Hz)
-//    - Output status
-//
-//  Controls:
-//    - Potentiometer: set simulated speed 0-200 km/h
-//    - Button 1 (GPIO 0):  reset trip distance
-//    - Button 2 (GPIO 35): start/stop pulse output
+//  Display shows (landscape 480x320):
+//    Left  - Large 7-segment speed readout (km/h)
+//    Right - Trip (km), Total (km), Pulse frequency (Hz)
+//    Bar   - Colour-coded speed bar graph
 //
 // ============================================================
 
 #include "config.h"
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
-#include <SPI.h>
+#include <TFT_eSPI.h>
 #include <Preferences.h>
 
-// ---- Display (software SPI for pin flexibility) ----
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
+// ---- Display ----
+TFT_eSPI    tft = TFT_eSPI();
+TFT_eSprite speedSpr = TFT_eSprite(&tft);  // Flicker-free speed
 
 // ---- NVS persistent storage ----
 Preferences prefs;
 
 // ---- Pulse generation (hardware timer) ----
-hw_timer_t *pulseTimer = NULL;
-volatile uint32_t pulseCount    = 0;
-volatile bool     pulseState    = false;
-bool              pulseActive   = true;
-bool              timerRunning  = false;
+hw_timer_t *pulseTimer   = NULL;
+volatile uint32_t pulseCount  = 0;
+volatile bool     pulseState  = false;
+bool              pulseActive = true;
+bool              timerRunning = false;
 
 // ---- Speed & distance ----
-float    currentSpeed   = 0;       // Raw speed from pot (km/h)
-float    smoothedSpeed  = 0;       // Filtered speed (km/h)
-float    tripDistance    = 0;       // Resettable trip (km)
-float    totalDistance   = 0;       // Persistent total (km)
-uint32_t lastPulseCount = 0;       // For distance delta calculation
+float    currentSpeed   = 0;
+float    smoothedSpeed  = 0;
+float    tripDistance    = 0;
+float    totalDistance   = 0;
+uint32_t lastPulseCount = 0;
 
 // ---- Timing ----
 unsigned long lastDisplayUpdate = 0;
@@ -63,7 +57,8 @@ int   prevSpeedFrac  = -1;
 float prevTrip       = -999;
 float prevTotal      = -999;
 float prevFreq       = -999;
-bool  prevActive     = !pulseActive;   // Force first draw
+int   prevBarWidth   = -1;
+bool  prevActive     = !pulseActive;
 
 // ---- Button debounce ----
 bool          lastResetState     = HIGH;
@@ -71,35 +66,28 @@ bool          lastStartStopState = HIGH;
 unsigned long lastResetTime      = 0;
 unsigned long lastStartStopTime  = 0;
 
-// ============================================================
+// ================================================================
 //  TIMER ISR - toggles the pulse output pin
-// ============================================================
+// ================================================================
 void IRAM_ATTR onPulseTimer() {
   pulseState = !pulseState;
-
   bool level = INVERT_OUTPUT ? !pulseState : pulseState;
-
-  if (level) {
+  if (level)
     GPIO.out_w1ts = ((uint32_t)1 << PULSE_PIN);
-  } else {
+  else
     GPIO.out_w1tc = ((uint32_t)1 << PULSE_PIN);
-  }
-
-  // Count completed cycles (one full HIGH+LOW = one pulse)
-  if (pulseState) {
-    pulseCount++;
-  }
+  if (pulseState) pulseCount++;
 }
 
-// ============================================================
-//  TIMER HELPERS (ESP32 Arduino Core v2 / v3 compatible)
-// ============================================================
+// ================================================================
+//  TIMER HELPERS  (ESP32 Arduino Core v2 / v3 compatible)
+// ================================================================
 void setupPulseTimer() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  pulseTimer = timerBegin(1000000);                    // 1 MHz tick
+  pulseTimer = timerBegin(1000000);
   timerAttachInterrupt(pulseTimer, &onPulseTimer);
 #else
-  pulseTimer = timerBegin(0, 80, true);                // Timer 0, prescaler 80 → 1 µs tick
+  pulseTimer = timerBegin(0, 80, true);
   timerAttachInterrupt(pulseTimer, &onPulseTimer, true);
 #endif
 }
@@ -123,300 +111,331 @@ void stopPulseTimer() {
   timerAlarmDisable(pulseTimer);
 #endif
   digitalWrite(PULSE_PIN, INVERT_OUTPUT ? HIGH : LOW);
-  pulseState  = false;
+  pulseState   = false;
   timerRunning = false;
 }
 
-// ============================================================
+// ================================================================
 //  UPDATE PULSE FREQUENCY
-// ============================================================
+// ================================================================
 void updatePulseFrequency(float speedKmh) {
   if (speedKmh < MIN_PULSE_SPEED || !pulseActive) {
     stopPulseTimer();
     return;
   }
-
-  // CANM8: freq = speed_mph * PULSE_MODE
-  // speed_mph = speed_kmh / 1.609344
   float freqHz = (speedKmh / 1.609344) * PULSE_MODE;
-
-  // Half-period in microseconds (timer fires on each edge)
   uint64_t halfPeriodUs = (uint64_t)(500000.0 / freqHz);
-  if (halfPeriodUs < 10) halfPeriodUs = 10;   // Safety floor
-
+  if (halfPeriodUs < 10) halfPeriodUs = 10;
   startPulseTimer(halfPeriodUs);
 }
 
-// ============================================================
+// ================================================================
 //  READ SPEED FROM POTENTIOMETER
-// ============================================================
+// ================================================================
 float readSpeed() {
-  // Multi-sample average to reduce ESP32 ADC noise
   long sum = 0;
-  for (int i = 0; i < ADC_SAMPLES; i++) {
-    sum += analogRead(POT_PIN);
-  }
-  int rawAdc = sum / ADC_SAMPLES;
-
-  // Dead zone at bottom end
-  if (rawAdc < ADC_DEADZONE) return 0;
-
-  // Linear map to speed range
-  float speed = (float)(rawAdc - ADC_DEADZONE) / (4095.0 - ADC_DEADZONE) * MAX_SPEED_KMH;
-  return constrain(speed, 0, MAX_SPEED_KMH);
+  for (int i = 0; i < ADC_SAMPLES; i++) sum += analogRead(POT_PIN);
+  int raw = sum / ADC_SAMPLES;
+  if (raw < ADC_DEADZONE) return 0;
+  float spd = (float)(raw - ADC_DEADZONE) / (4095.0 - ADC_DEADZONE) * MAX_SPEED_KMH;
+  return constrain(spd, 0, MAX_SPEED_KMH);
 }
 
-// ============================================================
+// ================================================================
 //  UPDATE DISTANCE COUNTERS
-// ============================================================
+// ================================================================
 void updateDistance() {
-  uint32_t current   = pulseCount;
-  uint32_t newPulses = current - lastPulseCount;
-  lastPulseCount     = current;
-
-  if (newPulses > 0) {
-    float km = (float)newPulses / PULSES_PER_KM;
+  uint32_t cur = pulseCount;
+  uint32_t delta = cur - lastPulseCount;
+  lastPulseCount = cur;
+  if (delta > 0) {
+    float km = (float)delta / PULSES_PER_KM;
     tripDistance  += km;
     totalDistance += km;
   }
 }
 
-// ============================================================
-//  DRAW STATIC DISPLAY LAYOUT (called once)
-// ============================================================
+// ================================================================
+//  DISPLAY - draw static layout (called once)
+// ================================================================
 void drawLayout() {
-  tft.fillScreen(ST77XX_BLACK);
+  tft.fillScreen(COLOR_BG);
 
-  // ---- Title bar ----
-  tft.fillRect(0, 0, 135, 28, COLOR_HEADER_BG);
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_HEADER_TEXT);
-  tft.setCursor(6, 4);
-  tft.print("TAXIMETER  PULSE");
-  tft.setCursor(30, 16);
-  tft.print("GENERATOR");
+  // ---- Header ----
+  tft.fillRect(0, 0, SCREEN_W, HEADER_H, COLOR_HEADER_BG);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(COLOR_HEADER_TEXT, COLOR_HEADER_BG);
+  tft.drawString("TAXIMETER PULSE GENERATOR", 10, HEADER_H / 2, 4);
 
-  // ---- Speed unit label ----
-  tft.setTextSize(2);
-  tft.setTextColor(COLOR_LABEL);
-  tft.setCursor(40, 88);
-  tft.print("km/h");
+  // ---- Vertical divider ----
+  tft.fillRect(PANEL_SPLIT_X - 2, CONTENT_TOP, 2, CONTENT_BOT - CONTENT_TOP, COLOR_DIVIDER);
 
-  // ---- Dividers and section labels ----
-  tft.drawFastHLine(4, 110, 127, COLOR_DIVIDER);
+  // ---- Left panel: "km/h" label ----
+  tft.setTextDatum(BC_DATUM);
+  tft.setTextColor(COLOR_LABEL, COLOR_BG);
+  tft.drawString("km/h", PANEL_SPLIT_X / 2, CONTENT_BOT - 4, 4);
 
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_LABEL);
-  tft.setCursor(4, 114);
-  tft.print("TRIP");
+  // ---- Right panel section backgrounds ----
+  // Trip
+  tft.fillRoundRect(RIGHT_X, SECT_TRIP_Y, RIGHT_W, SECT_TRIP_H, 4, COLOR_PANEL_BG);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COLOR_LABEL, COLOR_PANEL_BG);
+  tft.drawString("TRIP", RIGHT_X + 8, SECT_TRIP_Y + 6, 2);
 
-  tft.drawFastHLine(4, 152, 127, COLOR_DIVIDER);
+  // Total
+  tft.fillRoundRect(RIGHT_X, SECT_TOTAL_Y, RIGHT_W, SECT_TOTAL_H, 4, COLOR_PANEL_BG);
+  tft.setTextColor(COLOR_LABEL, COLOR_PANEL_BG);
+  tft.drawString("TOTAL", RIGHT_X + 8, SECT_TOTAL_Y + 6, 2);
 
-  tft.setCursor(4, 156);
-  tft.print("TOTAL");
+  // Output
+  tft.fillRoundRect(RIGHT_X, SECT_OUTPUT_Y, RIGHT_W, SECT_OUTPUT_H, 4, COLOR_PANEL_BG);
+  tft.setTextColor(COLOR_LABEL, COLOR_PANEL_BG);
+  tft.drawString("OUTPUT", RIGHT_X + 8, SECT_OUTPUT_Y + 6, 2);
 
-  tft.drawFastHLine(4, 194, 127, COLOR_DIVIDER);
+  // ---- Bottom bar background ----
+  tft.fillRect(0, BAR_Y, SCREEN_W, BAR_H, COLOR_BAR_BG);
 
-  // ---- Calibration info ----
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_LABEL);
-  tft.setCursor(4, 228);
-  char calStr[20];
-  snprintf(calStr, sizeof(calStr), "k=%ld p/km", PULSES_PER_KM);
-  tft.print(calStr);
+  // ---- Calibration info in output panel ----
+  char calBuf[28];
+  snprintf(calBuf, sizeof(calBuf), "k=%ld p/km   %dx mode", PULSES_PER_KM, PULSE_MODE);
+  tft.setTextDatum(BL_DATUM);
+  tft.setTextColor(COLOR_LABEL, COLOR_PANEL_BG);
+  tft.drawString(calBuf, RIGHT_X + 8, SECT_OUTPUT_Y + SECT_OUTPUT_H - 6, 2);
 }
 
-// ============================================================
-//  UPDATE DISPLAY (partial redraws for efficiency)
-// ============================================================
-void updateDisplay() {
+// ================================================================
+//  DISPLAY - speed (left panel, 7-segment with ghost segments)
+// ================================================================
+void updateSpeedDisplay() {
+  int sw = (int)smoothedSpeed;
+  int sf = (int)((smoothedSpeed - sw) * 10);
+  if (sw == prevSpeedWhole && sf == prevSpeedFrac) return;
+  prevSpeedWhole = sw;
+  prevSpeedFrac  = sf;
+
+  int sprW = PANEL_SPLIT_X - 6;
+  int sprH = 56;
+
+  speedSpr.createSprite(sprW, sprH);
+  speedSpr.fillSprite(COLOR_BG);
+
+  char ghost[] = "888.8";
+  char val[8];
+  snprintf(val, sizeof(val), "%3d.%d", sw, sf);
+
+  speedSpr.setTextDatum(MC_DATUM);
+
+  // Ghost segments (unlit)
+  speedSpr.setTextColor(COLOR_SPEED_GHOST);
+  speedSpr.drawString(ghost, sprW / 2, sprH / 2, 7);
+
+  // Active segments
+  speedSpr.setTextColor(COLOR_SPEED);
+  speedSpr.drawString(val, sprW / 2, sprH / 2, 7);
+
+  int yPos = CONTENT_TOP + (CONTENT_BOT - CONTENT_TOP - 40) / 2 - sprH / 2;
+  speedSpr.pushSprite(3, yPos);
+  speedSpr.deleteSprite();
+}
+
+// ================================================================
+//  DISPLAY - trip distance (right panel, top section)
+// ================================================================
+void updateTripDisplay() {
+  if (fabsf(tripDistance - prevTrip) < 0.0005) return;
+  prevTrip = tripDistance;
+
+  char buf[14];
+  if (tripDistance < 100.0)
+    snprintf(buf, sizeof(buf), "%.3f km", tripDistance);
+  else
+    snprintf(buf, sizeof(buf), "%.2f km", tripDistance);
+
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(COLOR_TRIP, COLOR_PANEL_BG);
+  tft.setTextPadding(RIGHT_W - 16);
+  tft.drawString(buf, RIGHT_X + 8, SECT_TRIP_Y + SECT_TRIP_H / 2 + 8, 4);
+}
+
+// ================================================================
+//  DISPLAY - total distance (right panel, middle section)
+// ================================================================
+void updateTotalDisplay() {
+  if (fabsf(totalDistance - prevTotal) < 0.005) return;
+  prevTotal = totalDistance;
+
+  char buf[14];
+  if (totalDistance < 1000.0)
+    snprintf(buf, sizeof(buf), "%.2f km", totalDistance);
+  else
+    snprintf(buf, sizeof(buf), "%.1f km", totalDistance);
+
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(COLOR_TOTAL, COLOR_PANEL_BG);
+  tft.setTextPadding(RIGHT_W - 16);
+  tft.drawString(buf, RIGHT_X + 8, SECT_TOTAL_Y + SECT_TOTAL_H / 2 + 8, 4);
+}
+
+// ================================================================
+//  DISPLAY - frequency & status (right panel, bottom section)
+// ================================================================
+void updateOutputDisplay() {
   float freqHz = 0;
-  if (smoothedSpeed >= MIN_PULSE_SPEED && pulseActive) {
+  if (smoothedSpeed >= MIN_PULSE_SPEED && pulseActive)
     freqHz = (smoothedSpeed / 1.609344) * PULSE_MODE;
-  }
 
-  int sWhole = (int)smoothedSpeed;
-  int sFrac  = (int)((smoothedSpeed - sWhole) * 10);
+  bool changed = (pulseActive != prevActive) || (fabsf(freqHz - prevFreq) > 0.08);
+  if (!changed) return;
+  prevActive = pulseActive;
+  prevFreq   = freqHz;
 
-  // ---- Speed (large) ----
-  if (sWhole != prevSpeedWhole || sFrac != prevSpeedFrac) {
-    tft.fillRect(0, 34, 135, 50, ST77XX_BLACK);
-    tft.setTextSize(5);
-    tft.setTextColor(COLOR_SPEED);
+  // Frequency value
+  char fBuf[12];
+  if (freqHz < 0.1)
+    snprintf(fBuf, sizeof(fBuf), "0.0 Hz");
+  else
+    snprintf(fBuf, sizeof(fBuf), "%.1f Hz", freqHz);
 
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%3d.%d", sWhole, sFrac);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(COLOR_FREQ, COLOR_PANEL_BG);
+  tft.setTextPadding(RIGHT_W - 16);
+  tft.drawString(fBuf, RIGHT_X + 8, SECT_OUTPUT_Y + 36, 4);
 
-    int16_t x1, y1;
-    uint16_t w, h;
-    tft.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-    tft.setCursor((135 - w) / 2, 38);
-    tft.print(buf);
+  // Status indicator (dot + text) on header right side
+  int dotX = SCREEN_W - 120;
+  int dotY = HEADER_H / 2;
+  tft.fillRect(dotX - 10, 4, 128, HEADER_H - 8, COLOR_HEADER_BG);
 
-    // Redraw unit label (overlaps cleared area boundary)
-    tft.setTextSize(2);
-    tft.setTextColor(COLOR_LABEL);
-    tft.setCursor(40, 88);
-    tft.print("km/h");
-
-    prevSpeedWhole = sWhole;
-    prevSpeedFrac  = sFrac;
-  }
-
-  // ---- Trip distance ----
-  if (fabsf(tripDistance - prevTrip) > 0.0005) {
-    tft.fillRect(0, 126, 135, 22, ST77XX_BLACK);
-    tft.setTextSize(2);
-    tft.setTextColor(COLOR_TRIP);
-
-    char buf[14];
-    if (tripDistance < 100.0)
-      snprintf(buf, sizeof(buf), "%7.3f km", tripDistance);
-    else
-      snprintf(buf, sizeof(buf), "%7.2f km", tripDistance);
-    tft.setCursor(2, 128);
-    tft.print(buf);
-
-    prevTrip = tripDistance;
-  }
-
-  // ---- Total distance ----
-  if (fabsf(totalDistance - prevTotal) > 0.005) {
-    tft.fillRect(0, 168, 135, 22, ST77XX_BLACK);
-    tft.setTextSize(2);
-    tft.setTextColor(COLOR_TOTAL);
-
-    char buf[14];
-    if (totalDistance < 1000.0)
-      snprintf(buf, sizeof(buf), "%7.2f km", totalDistance);
-    else
-      snprintf(buf, sizeof(buf), "%7.1f km", totalDistance);
-    tft.setCursor(2, 170);
-    tft.print(buf);
-
-    prevTotal = totalDistance;
-  }
-
-  // ---- Status indicator + frequency ----
-  if (pulseActive != prevActive || fabsf(freqHz - prevFreq) > 0.08) {
-    // Status line
-    tft.fillRect(0, 198, 135, 14, ST77XX_BLACK);
-    tft.setTextSize(1);
-
-    if (pulseActive && smoothedSpeed >= MIN_PULSE_SPEED) {
-      tft.fillCircle(10, 205, 4, COLOR_RUNNING);
-      tft.setTextColor(COLOR_RUNNING);
-      tft.setCursor(18, 201);
-      tft.print("ACTIVE");
-    } else if (!pulseActive) {
-      tft.fillCircle(10, 205, 4, COLOR_STOPPED);
-      tft.setTextColor(COLOR_STOPPED);
-      tft.setCursor(18, 201);
-      tft.print("STOPPED");
-    } else {
-      tft.fillCircle(10, 205, 4, COLOR_LABEL);
-      tft.setTextColor(COLOR_LABEL);
-      tft.setCursor(18, 201);
-      tft.print("IDLE");
-    }
-
-    // Frequency
-    tft.fillRect(0, 214, 100, 14, ST77XX_BLACK);
-    tft.setTextSize(2);
-    tft.setTextColor(COLOR_FREQ);
-
-    char buf[10];
-    if (freqHz < 0.1)
-      snprintf(buf, sizeof(buf), "  0.0");
-    else
-      snprintf(buf, sizeof(buf), "%5.1f", freqHz);
-    tft.setCursor(2, 214);
-    tft.print(buf);
-
-    tft.setTextSize(1);
-    tft.setTextColor(COLOR_LABEL);
-    tft.setCursor(66, 218);
-    tft.print("Hz");
-
-    prevActive = pulseActive;
-    prevFreq   = freqHz;
+  if (pulseActive && smoothedSpeed >= MIN_PULSE_SPEED) {
+    tft.fillCircle(dotX, dotY, 6, COLOR_RUNNING);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(COLOR_RUNNING, COLOR_HEADER_BG);
+    tft.drawString("ACTIVE", dotX + 12, dotY, 2);
+  } else if (!pulseActive) {
+    tft.fillCircle(dotX, dotY, 6, COLOR_STOPPED);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(COLOR_STOPPED, COLOR_HEADER_BG);
+    tft.drawString("STOPPED", dotX + 12, dotY, 2);
+  } else {
+    tft.fillCircle(dotX, dotY, 6, COLOR_LABEL);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(COLOR_LABEL, COLOR_HEADER_BG);
+    tft.drawString("IDLE", dotX + 12, dotY, 2);
   }
 }
 
-// ============================================================
+// ================================================================
+//  DISPLAY - speed bar graph (bottom strip)
+// ================================================================
+void updateSpeedBar() {
+  float ratio   = constrain(smoothedSpeed / MAX_SPEED_KMH, 0.0, 1.0);
+  int   maxBarW = SCREEN_W - 8;
+  int   fillW   = (int)(ratio * maxBarW);
+
+  if (fillW == prevBarWidth) return;
+  prevBarWidth = fillW;
+
+  int bx = 4, by = BAR_Y + 5, bh = BAR_H - 10;
+
+  // Colour based on speed zone
+  uint16_t col = COLOR_RUNNING;
+  if (smoothedSpeed > 120) col = COLOR_STOPPED;
+  else if (smoothedSpeed > 60) col = COLOR_FREQ;
+
+  // Filled portion
+  if (fillW > 0)
+    tft.fillRect(bx, by, fillW, bh, col);
+  // Empty portion
+  if (fillW < maxBarW)
+    tft.fillRect(bx + fillW, by, maxBarW - fillW, bh, COLOR_BAR_BG);
+
+  // Speed text overlay
+  char sBuf[16];
+  snprintf(sBuf, sizeof(sBuf), "%.1f km/h", smoothedSpeed);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);   // transparent-ish
+  tft.setTextPadding(0);
+  tft.drawString(sBuf, SCREEN_W / 2, by + bh / 2, 4);
+}
+
+// ================================================================
+//  DISPLAY - update all sections
+// ================================================================
+void updateDisplay() {
+  updateSpeedDisplay();
+  updateTripDisplay();
+  updateTotalDisplay();
+  updateOutputDisplay();
+  updateSpeedBar();
+}
+
+// ================================================================
 //  HANDLE BUTTON PRESSES
-// ============================================================
+// ================================================================
 void handleButtons() {
   unsigned long now = millis();
 
-  // ---- Trip reset button ----
-  bool resetState = digitalRead(BTN_TRIP_RESET);
-  if (resetState == LOW && lastResetState == HIGH && (now - lastResetTime) > DEBOUNCE_MS) {
+  bool rs = digitalRead(BTN_TRIP_RESET);
+  if (rs == LOW && lastResetState == HIGH && (now - lastResetTime) > DEBOUNCE_MS) {
     tripDistance = 0;
-    prevTrip    = -999;     // Force display refresh
+    prevTrip    = -999;
     lastResetTime = now;
     Serial.println("Trip reset");
   }
-  lastResetState = resetState;
+  lastResetState = rs;
 
-  // ---- Start / Stop button ----
-  bool ssState = digitalRead(BTN_START_STOP);
-  if (ssState == LOW && lastStartStopState == HIGH && (now - lastStartStopTime) > DEBOUNCE_MS) {
+  bool ss = digitalRead(BTN_START_STOP);
+  if (ss == LOW && lastStartStopState == HIGH && (now - lastStartStopTime) > DEBOUNCE_MS) {
     pulseActive = !pulseActive;
-    prevActive  = !pulseActive;   // Force display refresh
+    prevActive  = !pulseActive;
     lastStartStopTime = now;
-    Serial.print("Pulse output: ");
+    Serial.print("Pulse: ");
     Serial.println(pulseActive ? "ACTIVE" : "STOPPED");
   }
-  lastStartStopState = ssState;
+  lastStartStopState = ss;
 }
 
-// ============================================================
-//  SAVE TOTAL DISTANCE TO NVS
-// ============================================================
+// ================================================================
+//  SAVE TOTAL DISTANCE
+// ================================================================
 void saveTotalDistance() {
   prefs.putFloat("totalDist", totalDistance);
 }
 
-// ============================================================
+// ================================================================
 //  SPLASH SCREEN
-// ============================================================
+// ================================================================
 void showSplash() {
-  tft.fillScreen(ST77XX_BLACK);
+  tft.fillScreen(TFT_BLACK);
 
-  tft.setTextSize(2);
+  tft.setTextDatum(MC_DATUM);
   tft.setTextColor(COLOR_SPEED);
-  tft.setCursor(4, 50);
-  tft.print("TAXIMETER");
-  tft.setCursor(20, 75);
-  tft.print("PULSE");
-  tft.setCursor(30, 100);
-  tft.print("GEN");
+  tft.drawString("TAXIMETER", SCREEN_W / 2, 80, 4);
+  tft.drawString("PULSE GENERATOR", SCREEN_W / 2, 120, 4);
 
-  tft.setTextSize(1);
   tft.setTextColor(COLOR_LABEL);
-  tft.setCursor(8, 140);
-  tft.print("CANM8 Compatible");
+  tft.drawString("CANM8 CANNECT PULSE Compatible", SCREEN_W / 2, 170, 2);
 
-  char calStr[24];
-  snprintf(calStr, sizeof(calStr), "k = %ld pulses/km", PULSES_PER_KM);
-  tft.setCursor(8, 158);
-  tft.print(calStr);
+  char calBuf[32];
+  snprintf(calBuf, sizeof(calBuf), "k = %ld pulses/km", PULSES_PER_KM);
+  tft.drawString(calBuf, SCREEN_W / 2, 200, 2);
 
-  tft.setCursor(8, 176);
+  char modeBuf[24];
   if (PULSE_MODE == 1)
-    tft.print("Mode: 1 Hz/MPH (std)");
-  else if (PULSE_MODE == 4)
-    tft.print("Mode: 4 Hz/MPH");
+    snprintf(modeBuf, sizeof(modeBuf), "Mode: 1 Hz/MPH (std)");
   else
-    tft.print("Mode: 10 Hz/MPH");
+    snprintf(modeBuf, sizeof(modeBuf), "Mode: %d Hz/MPH", PULSE_MODE);
+  tft.drawString(modeBuf, SCREEN_W / 2, 225, 2);
+
+  tft.setTextColor(COLOR_DIVIDER);
+  tft.drawString("MSP4021 4.0\" ST7796 480x320", SCREEN_W / 2, 270, 1);
 
   delay(2500);
 }
 
-// ============================================================
+// ================================================================
 //  SETUP
-// ============================================================
+// ================================================================
 void setup() {
   Serial.begin(115200);
   Serial.println("\n=== Taximeter Pulse Generator ===");
@@ -426,29 +445,28 @@ void setup() {
   Serial.print(PULSES_PER_KM);
   Serial.println(" pulses/km)");
 
+  // ---- Disable built-in TFT (T-Display boards) ----
+  pinMode(BUILTIN_TFT_CS, OUTPUT);
+  digitalWrite(BUILTIN_TFT_CS, HIGH);
+
   // ---- GPIO ----
   pinMode(PULSE_PIN, OUTPUT);
   digitalWrite(PULSE_PIN, INVERT_OUTPUT ? HIGH : LOW);
-
   pinMode(POT_PIN, INPUT);
   pinMode(BTN_TRIP_RESET, INPUT_PULLUP);
   pinMode(BTN_START_STOP, INPUT_PULLUP);
 
-  // ---- Backlight ----
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
-
   // ---- Display ----
-  tft.init(135, 240);
-  tft.setRotation(0);       // Portrait
-  tft.fillScreen(ST77XX_BLACK);
+  tft.init();
+  tft.setRotation(1);          // Landscape 480x320
+  tft.fillScreen(TFT_BLACK);
 
   showSplash();
 
   // ---- Load persistent total distance ----
   prefs.begin("taximeter", false);
   totalDistance = prefs.getFloat("totalDist", 0.0);
-  Serial.print("Loaded total distance: ");
+  Serial.print("Total distance loaded: ");
   Serial.print(totalDistance, 2);
   Serial.println(" km");
 
@@ -458,7 +476,7 @@ void setup() {
   // ---- ADC ----
   analogReadResolution(12);
 #if ESP_ARDUINO_VERSION_MAJOR < 3
-  analogSetAttenuation(ADC_11db);   // Full 0-3.3 V range
+  analogSetAttenuation(ADC_11db);
 #endif
 
   // ---- Draw UI ----
@@ -467,34 +485,34 @@ void setup() {
   Serial.println("Ready - turn the potentiometer to set speed");
 }
 
-// ============================================================
+// ================================================================
 //  MAIN LOOP
-// ============================================================
+// ================================================================
 void loop() {
   unsigned long now = millis();
 
-  // ---- Read speed ----
+  // Read & filter speed
   currentSpeed  = readSpeed();
   smoothedSpeed = smoothedSpeed * (1.0 - SPEED_SMOOTHING)
                 + currentSpeed  * SPEED_SMOOTHING;
   if (smoothedSpeed < 0.3) smoothedSpeed = 0;
 
-  // ---- Update pulse output ----
+  // Pulse output
   updatePulseFrequency(smoothedSpeed);
 
-  // ---- Accumulate distance from pulse count ----
+  // Distance from pulse count
   updateDistance();
 
-  // ---- Buttons ----
+  // Buttons
   handleButtons();
 
-  // ---- Display refresh ----
+  // Display
   if (now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
     updateDisplay();
     lastDisplayUpdate = now;
   }
 
-  // ---- Periodic NVS save ----
+  // Periodic NVS save
   if (now - lastDistSave >= SAVE_INTERVAL_MS) {
     saveTotalDistance();
     lastDistSave = now;
